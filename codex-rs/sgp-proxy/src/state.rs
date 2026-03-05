@@ -30,7 +30,12 @@ pub struct ProxyState {
 
 impl ProxyState {
     pub fn new(args: &Args, auth_header: &'static str) -> Arc<Self> {
-        let client = AgentexClient::new(args.agentex_url.clone(), auth_header);
+        let client = AgentexClient::new(
+            args.agentex_url.clone(),
+            args.agent_id.clone(),
+            auth_header,
+            args.account_id.clone(),
+        );
         let agent_tools: HashSet<String> = args.agent_tools.iter().cloned().collect();
 
         Arc::new(Self {

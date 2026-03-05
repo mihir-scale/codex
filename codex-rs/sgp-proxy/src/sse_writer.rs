@@ -141,6 +141,35 @@ impl SseEvent {
         }
     }
 
+    pub fn output_item_added_message(item_id: &str) -> Self {
+        Self {
+            event_type: "response.output_item.added".to_string(),
+            data: json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": item_id,
+                    "content": [{"type": "output_text", "text": ""}]
+                }
+            }),
+        }
+    }
+
+    pub fn output_item_added_reasoning(item_id: &str) -> Self {
+        Self {
+            event_type: "response.output_item.added".to_string(),
+            data: json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "reasoning",
+                    "id": item_id,
+                    "summary": []
+                }
+            }),
+        }
+    }
+
     pub fn output_text_delta(delta: &str) -> Self {
         Self {
             event_type: "response.output_text.delta".to_string(),
@@ -239,11 +268,9 @@ mod tests {
         let event = SseEvent::output_item_done_reasoning(
             "item_0",
             &[ReasoningSummaryEntry {
-                entry_type: "summary_text".to_string(),
                 text: "thinking".to_string(),
             }],
             &[ReasoningContentEntry {
-                entry_type: "reasoning_text".to_string(),
                 text: "deep thought".to_string(),
             }],
         );

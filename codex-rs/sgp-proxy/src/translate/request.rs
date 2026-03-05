@@ -1,120 +1,88 @@
 use serde_json::Value;
 
-use super::types::TaskMessage;
+use super::types::MessageSendParams;
 use super::types::TaskMessageContent;
 use crate::error::ProxyError;
 
-/// Translate a Responses API request body into Agentex `TaskMessage` items.
+/// Translate a Responses API request body into Agentex `MessageSendParams`.
 ///
-/// The function walks the `input` array and the optional `instructions` field,
-/// producing content entries that can be sent via `message/send`.
+/// Agentex `message/send` accepts a single `content` item per call, so we
+/// build a composite text from the full conversation history. The last user
+/// message is used as the primary content; earlier messages and instructions
+/// are folded into a context preamble.
 pub fn translate_request(
     body: &Value,
     is_first_turn: bool,
-) -> Result<Vec<TaskMessage>, ProxyError> {
-    let mut messages: Vec<TaskMessage> = Vec::new();
-
-    // Inject instructions as first user text on first turn (or always in per-request mode).
-    if is_first_turn
-        && let Some(instructions) = body.get("instructions").and_then(Value::as_str)
-        && !instructions.is_empty()
-    {
-        messages.push(TaskMessage {
-            role: "user".to_string(),
-            content: vec![TaskMessageContent::Text {
-                text: instructions.to_string(),
-                author: Some("user".to_string()),
-                format: Some("markdown".to_string()),
-            }],
-        });
-    }
-
+    task_id: Option<&str>,
+    task_name: Option<&str>,
+) -> Result<MessageSendParams, ProxyError> {
     let input = body
         .get("input")
         .and_then(Value::as_array)
         .ok_or_else(|| ProxyError::RequestParse("missing or invalid 'input' array".into()))?;
+
+    let wants_stream = body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    // Find the last user-role message to use as the primary content.
+    // Also collect any function_call_output items — those need to be sent as
+    // tool_response content instead.
+    let mut last_user_text: Option<String> = None;
+    let mut last_tool_response: Option<TaskMessageContent> = None;
+    let mut context_parts: Vec<String> = Vec::new();
+
+    // Inject instructions as context on first turn.
+    if is_first_turn
+        && let Some(instructions) = body.get("instructions").and_then(Value::as_str)
+        && !instructions.is_empty()
+    {
+        context_parts.push(format!("[System Instructions]\n{instructions}"));
+    }
 
     for item in input {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
 
         match item_type {
             "message" => {
-                let role = item
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or("user");
-                let author = match role {
-                    "assistant" => "agent",
-                    "developer" => "user",
-                    _ => "user",
-                };
-                let agentex_role = match role {
-                    "assistant" => "assistant",
-                    _ => "user",
-                };
+                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
 
-                let mut content_items = Vec::new();
                 if let Some(content_arr) = item.get("content").and_then(Value::as_array) {
                     for c in content_arr {
                         let c_type = c.get("type").and_then(Value::as_str).unwrap_or("");
-                        match c_type {
-                            "input_text" | "output_text" => {
-                                if let Some(text) = c.get("text").and_then(Value::as_str) {
-                                    let mut tc = TaskMessageContent::Text {
-                                        text: text.to_string(),
-                                        author: Some(author.to_string()),
-                                        format: None,
-                                    };
-                                    if role == "developer"
-                                        && let TaskMessageContent::Text {
-                                            ref mut format, ..
-                                        } = tc
-                                    {
-                                        *format = Some("markdown".to_string());
-                                    }
-                                    content_items.push(tc);
+                        if matches!(c_type, "input_text" | "output_text")
+                            && let Some(text) = c.get("text").and_then(Value::as_str)
+                        {
+                            if role == "user" || role == "developer" {
+                                if let Some(prev) = last_user_text.take() {
+                                    context_parts.push(format!("[User]\n{prev}"));
                                 }
-                            }
-                            _ => {
-                                // Skip unsupported content types (input_image, etc.)
+                                last_user_text = Some(text.to_string());
+                            } else {
+                                context_parts.push(format!("[Assistant]\n{text}"));
                             }
                         }
                     }
                 }
-
-                if !content_items.is_empty() {
-                    messages.push(TaskMessage {
-                        role: agentex_role.to_string(),
-                        content: content_items,
-                    });
-                }
             }
 
             "function_call" => {
-                let call_id = item
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
                 let name = item
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                    .unwrap_or("unknown");
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let arguments = item
                     .get("arguments")
                     .and_then(Value::as_str)
-                    .unwrap_or("{}")
-                    .to_string();
-
-                messages.push(TaskMessage {
-                    role: "assistant".to_string(),
-                    content: vec![TaskMessageContent::ToolRequest {
-                        tool_call_id: call_id,
-                        name,
-                        arguments,
-                    }],
-                });
+                    .unwrap_or("{}");
+                context_parts.push(format!(
+                    "[Tool Call: {name} ({call_id})]\n{arguments}"
+                ));
             }
 
             "function_call_output" => {
@@ -123,7 +91,7 @@ pub fn translate_request(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                // The output can be a string or a nested object with "output" field.
+
                 let output = if let Some(s) = item.get("output").and_then(Value::as_str) {
                     s.to_string()
                 } else if let Some(obj) = item.get("output") {
@@ -132,62 +100,64 @@ pub fn translate_request(
                     String::new()
                 };
 
-                // We need the tool name for Agentex. It may not be in the
-                // output item itself, so we use a placeholder that the caller
-                // can resolve from session state.
-                messages.push(TaskMessage {
-                    role: "user".to_string(),
-                    content: vec![TaskMessageContent::ToolResponse {
-                        tool_call_id: call_id,
-                        name: String::new(), // resolved by caller from session state
-                        content: output,
-                    }],
+                // The most recent function_call_output becomes the primary
+                // content (as a tool_response), since the agent needs to
+                // continue from it.
+                last_tool_response = Some(TaskMessageContent::ToolResponse {
+                    author: "user".to_string(),
+                    tool_call_id: call_id,
+                    name: String::new(), // resolved by caller from session state
+                    content: serde_json::Value::String(output),
                 });
             }
 
             "reasoning" => {
-                let summary = item
-                    .get("summary")
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|s| {
-                                Some(super::types::ReasoningSummaryEntry {
-                                    entry_type: "summary_text".to_string(),
-                                    text: s.get("text").and_then(Value::as_str)?.to_string(),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let content = item
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|c| {
-                                Some(super::types::ReasoningContentEntry {
-                                    entry_type: "reasoning_text".to_string(),
-                                    text: c.get("text").and_then(Value::as_str)?.to_string(),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                messages.push(TaskMessage {
-                    role: "assistant".to_string(),
-                    content: vec![TaskMessageContent::Reasoning { summary, content }],
-                });
+                if let Some(summary_arr) = item.get("summary").and_then(Value::as_array) {
+                    let texts: Vec<&str> = summary_arr
+                        .iter()
+                        .filter_map(|s| s.get("text").and_then(Value::as_str))
+                        .collect();
+                    if !texts.is_empty() {
+                        context_parts
+                            .push(format!("[Reasoning]\n{}", texts.join("\n")));
+                    }
+                }
             }
 
-            // Skip local_shell_call, web_search_call, etc.
-            _ => {}
+            _ => {} // Skip local_shell_call, web_search_call, etc.
         }
     }
 
-    Ok(messages)
+    // If we have a tool_response, use that as the primary content (the agent
+    // is waiting for tool results). Otherwise, use the last user text.
+    let content = if let Some(tool_resp) = last_tool_response {
+        tool_resp
+    } else {
+        let text = last_user_text.unwrap_or_default();
+        let full_text = if context_parts.is_empty() {
+            text
+        } else {
+            // Prepend conversation context before the latest user message.
+            context_parts.push(format!("[User]\n{text}"));
+            context_parts.join("\n\n")
+        };
+
+        TaskMessageContent::Text {
+            author: "user".to_string(),
+            content: full_text,
+            format: Some("plain".to_string()),
+            style: None,
+            attachments: Some(vec![]),
+        }
+    };
+
+    Ok(MessageSendParams {
+        task_id: task_id.map(String::from),
+        task_name: task_name.map(String::from),
+        content,
+        stream: Some(wants_stream),
+        task_params: None,
+    })
 }
 
 #[cfg(test)]
@@ -196,7 +166,36 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_translate_user_message() {
+    fn test_translate_simple_user_message() {
+        let body = json!({
+            "instructions": "You are a helpful assistant.",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hello"}]
+                }
+            ],
+            "stream": true
+        });
+
+        let params = translate_request(&body, true, Some("task-1"), None).unwrap();
+        assert_eq!(params.task_id.as_deref(), Some("task-1"));
+        assert_eq!(params.stream, Some(true));
+        match &params.content {
+            TaskMessageContent::Text {
+                content, author, ..
+            } => {
+                assert_eq!(author, "user");
+                assert!(content.contains("Hello"));
+                assert!(content.contains("[System Instructions]"));
+            }
+            _ => panic!("expected Text content"),
+        }
+    }
+
+    #[test]
+    fn test_translate_no_instructions_on_subsequent_turn() {
         let body = json!({
             "instructions": "You are a helpful assistant.",
             "input": [
@@ -208,60 +207,18 @@ mod tests {
             ]
         });
 
-        let messages = translate_request(&body, true).unwrap();
-        assert_eq!(messages.len(), 2);
-
-        // First message: instructions
-        match &messages[0].content[0] {
-            TaskMessageContent::Text {
-                text,
-                author,
-                format,
-            } => {
-                assert_eq!(text, "You are a helpful assistant.");
-                assert_eq!(author.as_deref(), Some("user"));
-                assert_eq!(format.as_deref(), Some("markdown"));
+        let params = translate_request(&body, false, Some("task-1"), None).unwrap();
+        match &params.content {
+            TaskMessageContent::Text { content, .. } => {
+                assert!(!content.contains("[System Instructions]"));
+                assert_eq!(content, "Hello");
             }
-            _ => panic!("expected Text"),
-        }
-
-        // Second message: user input
-        assert_eq!(messages[1].role, "user");
-        match &messages[1].content[0] {
-            TaskMessageContent::Text { text, author, .. } => {
-                assert_eq!(text, "Hello");
-                assert_eq!(author.as_deref(), Some("user"));
-            }
-            _ => panic!("expected Text"),
+            _ => panic!("expected Text content"),
         }
     }
 
     #[test]
-    fn test_translate_assistant_message() {
-        let body = json!({
-            "input": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "Hi there"}]
-                }
-            ]
-        });
-
-        let messages = translate_request(&body, false).unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, "assistant");
-        match &messages[0].content[0] {
-            TaskMessageContent::Text { text, author, .. } => {
-                assert_eq!(text, "Hi there");
-                assert_eq!(author.as_deref(), Some("agent"));
-            }
-            _ => panic!("expected Text"),
-        }
-    }
-
-    #[test]
-    fn test_translate_function_call_and_output() {
+    fn test_translate_function_call_output() {
         let body = json!({
             "input": [
                 {
@@ -273,82 +230,39 @@ mod tests {
                 {
                     "type": "function_call_output",
                     "call_id": "call_1",
-                    "output": "file contents"
+                    "output": "file contents here"
                 }
             ]
         });
 
-        let messages = translate_request(&body, false).unwrap();
-        assert_eq!(messages.len(), 2);
-
-        match &messages[0].content[0] {
-            TaskMessageContent::ToolRequest {
-                tool_call_id,
-                name,
-                arguments,
-            } => {
-                assert_eq!(tool_call_id, "call_1");
-                assert_eq!(name, "read_file");
-                assert_eq!(arguments, "{\"path\":\"/tmp/foo\"}");
-            }
-            _ => panic!("expected ToolRequest"),
-        }
-
-        match &messages[1].content[0] {
+        let params = translate_request(&body, false, Some("task-1"), None).unwrap();
+        match &params.content {
             TaskMessageContent::ToolResponse {
                 tool_call_id,
                 content,
                 ..
             } => {
                 assert_eq!(tool_call_id, "call_1");
-                assert_eq!(content, "file contents");
+                assert_eq!(content, &serde_json::Value::String("file contents here".into()));
             }
-            _ => panic!("expected ToolResponse"),
+            _ => panic!("expected ToolResponse content"),
         }
     }
 
     #[test]
-    fn test_translate_reasoning() {
+    fn test_translate_with_task_name() {
         let body = json!({
-            "input": [
-                {
-                    "type": "reasoning",
-                    "id": "r1",
-                    "summary": [{"type": "summary_text", "text": "thinking"}],
-                    "content": [{"type": "reasoning_text", "text": "deep thought"}]
-                }
-            ]
-        });
-
-        let messages = translate_request(&body, false).unwrap();
-        assert_eq!(messages.len(), 1);
-        match &messages[0].content[0] {
-            TaskMessageContent::Reasoning { summary, content } => {
-                assert_eq!(summary.len(), 1);
-                assert_eq!(summary[0].text, "thinking");
-                assert_eq!(content.len(), 1);
-                assert_eq!(content[0].text, "deep thought");
-            }
-            _ => panic!("expected Reasoning"),
-        }
-    }
-
-    #[test]
-    fn test_skip_instructions_on_non_first_turn() {
-        let body = json!({
-            "instructions": "You are a helpful assistant.",
             "input": [
                 {
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "Hello"}]
+                    "content": [{"type": "input_text", "text": "hi"}]
                 }
             ]
         });
 
-        let messages = translate_request(&body, false).unwrap();
-        // Instructions should be skipped on non-first turn
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, "user");
+        let params = translate_request(&body, true, None, Some("my-task")).unwrap();
+        assert!(params.task_id.is_none());
+        assert_eq!(params.task_name.as_deref(), Some("my-task"));
     }
 }

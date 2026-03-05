@@ -30,6 +30,10 @@ pub struct Args {
     #[arg(long)]
     pub agent_id: String,
 
+    /// Agentex account ID (sent as `x-selected-account-id` header).
+    #[arg(long)]
+    pub account_id: Option<String>,
+
     /// Task lifecycle mode.
     #[arg(long, value_enum, default_value_t = TaskLifecycleMode::PerSession)]
     pub task_lifecycle: TaskLifecycleMode,
